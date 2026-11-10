@@ -52,6 +52,24 @@
   sending mail; previously this project had no document even flagging that gap.
 - **Backend test framework: pytest — APPROVED**, minimum scope for Phase 1; see
   `09-TESTING-STRATEGY.md`.
+- **Database connectivity: async SQLAlchemy — APPROVED** (Phase 0 technical
+  review). The FastAPI application uses async SQLAlchemy sessions throughout,
+  via the `asyncpg` driver, for all application database operations. Alembic
+  migrations run separately, synchronously, via the `psycopg` driver — Alembic
+  itself is not async, so it connects directly with its own sync engine rather
+  than through the app's async session machinery. `Settings.sync_database_url`
+  (`backend/app/config.py`) derives the Alembic URL from the same
+  `DATABASE_URL`, swapping only the driver scheme, so the two are never
+  configured independently. This does not change the approved database
+  architecture (schema, transaction flows, lock ordering) — it fixes the
+  driver/runtime pairing used to reach it.
+
+### Revision history
+
+- 2026-11-10: Added the async SQLAlchemy (`asyncpg`) / sync Alembic
+  (`psycopg`) driver decision above, per Phase 0 technical review. No prior
+  entry existed for this; it was an implementation detail that had not yet
+  been recorded as an approved decision.
 
 ## Unresolved / not yet decided
 

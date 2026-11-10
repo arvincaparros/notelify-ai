@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Notelify AI",
+  "version": "0.1.0",
+  "description": "AI meeting assistant -- Phase 0 skeleton, no capture or auth yet.",
+  "action": {
+    "default_popup": "popup/popup.html"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "permissions": ["sidePanel"]
+}
