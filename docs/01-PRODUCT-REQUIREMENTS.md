@@ -3,7 +3,7 @@
 **Status:** APPROVED (requirements and acceptance criteria below reflect decisions
 made during architecture brainstorming; no new requirements have been invented
 beyond what was discussed)
-**Last updated:** 2026-11-09
+**Last updated:** 2026-11-10
 
 ## Functional Requirements
 
@@ -165,8 +165,11 @@ sync, and any distributed queue/worker infrastructure (Redis/Celery).
 
 ## Outstanding / unresolved items
 
-- Exact enforcement point and flow for email verification (block login
-  entirely vs. allow with reduced functionality) — not yet decided.
+- **Resolved**: registration auto-logs the user in, and email verification is
+  informational-only in v1 — no feature is gated on `email_verified_at`. See
+  `05-API-CONTRACTS.md` §B.1 and `08-SECURITY-AND-AUTHENTICATION.md`. **Still open,
+  product-level**: what verification is actually *for* given nothing is gated on it —
+  not a technical gap, but worth an explicit answer before it's forgotten.
 - Exact free-tier quota minute value and additional plan tiers' values — only
   the *mechanism* (a `plan_tiers` lookup table) is approved; actual numbers
   are a product decision still pending.

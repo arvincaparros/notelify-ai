@@ -1,18 +1,63 @@
 # Notelify AI — Testing Strategy
 
-**Status:** DRAFT / PROPOSED — unlike the database design, this strategy was
-not negotiated round-by-round with the product owner. It is derived logically
-from the already-approved architecture and database concurrency design, but
-it requires explicit review and approval before being treated as binding.
-**Last updated:** 2026-11-09
+**Status:** PARTIALLY APPROVED — a minimum testing foundation for Phase 1 (below) is
+now approved. Everything else in this document (full coverage targets, extension/
+dashboard-specific testing, end-to-end testing beyond Phase 1's minimum) remains
+DRAFT/PROPOSED, not negotiated round-by-round the way the database design was.
+**Last updated:** 2026-11-10
 
-## Why this is a draft
+## Minimum Phase 1 Testing Foundation (APPROVED)
 
-The database design in `04-DATABASE-DESIGN.md` went through six rounds of
-explicit correction and approval. This testing strategy has not — it is a
-first pass proposing how that approved design (and the rest of the
-architecture) should be verified, written so there is something concrete to
-react to rather than starting implementation with no test plan at all.
+This section exists specifically to unblock Phase 1 (`10-IMPLEMENTATION-ROADMAP.md`)
+without re-litigating the entire draft strategy below — it approves the minimum needed
+to start, and explicitly leaves the rest open.
+
+- **Backend test framework: pytest — APPROVED.**
+- **PostgreSQL-backed integration tests — APPROVED.** Tests hit a real Postgres, never
+  a mock — consistent with how much of this project's correctness is about actual
+  row-level locking and advisory-lock behavior, which a mock cannot exercise
+  meaningfully.
+- **Real ephemeral Postgres for transaction/concurrency tests — APPROVED**, with a
+  concrete isolation strategy: a single Postgres database is created once per test
+  session (via Docker, migrated once with Alembic at session start), not once per test.
+  Ordinary tests wrap each test in a transaction rolled back at the end (fast, isolated
+  — the standard pytest+SQLAlchemy pattern). **Concurrency tests cannot use that
+  pattern** — testing real lock contention requires multiple independently-committing
+  connections interacting, which a wrapping transaction would prevent by construction.
+  Concurrency tests get their own explicit setup/teardown (truncating the relevant
+  tables, not relying on rollback) and should be clearly separated — e.g. a
+  `tests/concurrency/` directory or a `@pytest.mark.concurrency` marker — so they're
+  never accidentally run under the fast-rollback fixture meant for everything else.
+- **Authentication tests — APPROVED as a required minimum for Phase 1 sign-off**:
+  registration (including the email-uniqueness race), login (including a **dedicated
+  regression test for the login/password-reset/logout-all concurrency fix** in
+  `05-API-CONTRACTS.md` §A.3 — this closed a real race found during design review, and
+  silently regressing it would be worse than not having found it), logout and
+  logout-all, refresh-token rotation (normal rotation, the grace-period chain-walk, and
+  family-wide reuse-detection revocation), and the email-verification/password-reset
+  token lifecycle (expiry, and the deliberate replay-semantics difference between the
+  two — idempotent-success for verification, hard error for reset).
+- **Database migration tests — APPROVED, minimum scope**: migrations apply cleanly,
+  forward-only, to an empty database — consistent with `04-DATABASE-DESIGN.md`'s
+  additive-only migration philosophy. Full up/down (`downgrade`) testing is
+  **explicitly deferred**, not required for v1.
+- **API contract tests — APPROVED, minimum scope**: once endpoints are implemented,
+  validate request/response shapes against the contracts documented in
+  `05-API-CONTRACTS.md`. Exact tooling (e.g. schemathesis vs. hand-written
+  Pydantic-model assertions) is **left open**, not decided by this approval.
+
+**Explicitly kept open, per instruction, not silently resolved**: full test coverage
+targets/thresholds, and all end-to-end/extension/dashboard testing detail beyond what
+layer 3/4 below already sketch — these remain DRAFT, to be refined later, not part of
+this Phase 1 minimum.
+
+## Why the rest of this document is still a draft
+
+The database design in `04-DATABASE-DESIGN.md` went through seven rounds of
+explicit correction and approval. The remainder of this testing strategy has not — it
+is a first pass proposing how the broader architecture should be verified beyond the
+Phase 1 minimum above, written so there is something concrete to react to rather than
+starting implementation with no test plan at all.
 
 ## Proposed testing layers
 
@@ -51,11 +96,13 @@ document's revision history and flow descriptions:
 
 ### 2. Backend contract tests
 
-Deferred until `05-API-CONTRACTS.md` is actually designed and approved —
-there is no contract to test against yet. Once it exists: request/response
-shape validation, auth/ownership enforcement (a user cannot read/write
-another user's meeting), and quota-exceeded/meeting-closed/reconciliation-
-timeout response handling.
+`05-API-CONTRACTS.md`'s architecture (Round 1) and Authentication endpoints (Round 2)
+are now approved, so authentication contract tests are in scope for Phase 1 (see the
+Phase 1 minimum above). The remaining endpoint groups (meetings, chunks, transcript/
+intelligence, notes/action items, usage/search) are still not designed — contract tests
+for those stay deferred until each round is approved. Once in scope: request/response
+shape validation, auth/ownership enforcement (a user cannot read/write another user's
+meeting), and quota-exceeded/meeting-closed/reconciliation-timeout response handling.
 
 ### 3. Extension integration tests
 
@@ -75,7 +122,8 @@ decisions, and action items are persisted and retrievable.
 ### 5. Security tests
 
 - A user cannot access another user's meeting, notes, decisions, or action
-  items via any endpoint, once `05-API-CONTRACTS.md` exists.
+  items via any endpoint, once each respective endpoint group is designed and
+  implemented (authentication's ownership rules are already approved and in scope now).
 - Groq credentials never appear in any extension or dashboard bundle/network
   request (static check, part of CI).
 
@@ -86,14 +134,11 @@ which of the layers above apply to it.
 
 ## Unresolved
 
-- Test framework choices (e.g. pytest for backend; a JS/TS test runner for
-  extension and dashboard) — not yet decided (also noted in
+- **Resolved by the Phase 1 minimum above**: backend framework (pytest) and the
+  ephemeral-Postgres question for concurrency tests — no longer open.
+- JS/TS test runner for the extension and dashboard — not yet decided (also noted in
   `03-TECHNOLOGY-STACK.md`).
-- Whether concurrency tests run against a real ephemeral Postgres (e.g. via
-  Docker in CI) or some other mechanism — a real instance is recommended
-  given how much of the design's correctness is about actual row-level
-  locking behavior, but this hasn't been agreed.
 - Coverage targets/thresholds, if any.
-- This entire document needs explicit product-owner review before being
-  treated as approved, the same way the database design was reviewed round
-  by round.
+- Full end-to-end, extension integration, and dashboard testing detail beyond the
+  Phase 1 minimum and the sketches in layers 3/4 below — needs explicit product-owner
+  review before being treated as approved, the same way Phase 1's minimum just was.

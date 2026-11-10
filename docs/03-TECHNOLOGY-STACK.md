@@ -1,7 +1,7 @@
 # Notelify AI — Technology Stack
 
 **Status:** APPROVED
-**Last updated:** 2026-11-09
+**Last updated:** 2026-11-10
 
 ## Given (specified by product owner, not negotiated)
 
@@ -40,16 +40,27 @@
   wouldn't allow.
 - **Deployment: Docker Compose, local only, for v1.** No cloud target
   (AWS/GCP/Fly.io/etc.) is in scope yet — explicitly deferred.
+- **Password hashing: Argon2id — APPROVED.** OWASP's current recommended default for
+  new systems. Exact parameters (memory cost, iterations) remain unresolved, below.
+- **Email sending: an `EmailProvider` interface — APPROVED as an approach**, mirroring
+  the same provider-interface pattern already used for Groq Whisper/LLM. For local
+  development, a self-hosted catch-all SMTP tool (e.g. Mailpit) runs as another Docker
+  Compose service, sending nothing real. The production vendor (e.g. SendGrid,
+  Postmark, Amazon SES, Resend) is a separate, deferred decision — none of it changes
+  the API contracts, since it's entirely behind the interface. Required because
+  registration, password reset, and resend-verification all depend on *something*
+  sending mail; previously this project had no document even flagging that gap.
+- **Backend test framework: pytest — APPROVED**, minimum scope for Phase 1; see
+  `09-TESTING-STRATEGY.md`.
 
 ## Unresolved / not yet decided
 
-- Specific password-hashing algorithm (bcrypt vs. argon2, work factor) — not
-  yet chosen.
-- Specific JWT signing algorithm/library, access-token lifetime, and
-  refresh-token lifetime — not yet numerically decided.
+- Argon2id work-factor parameters (memory cost, iterations).
+- Specific JWT signing algorithm/library; access-token lifetime (proposed 15 min),
+  refresh-token lifetime (proposed 30 days) — mechanism approved, numbers not.
+- Production email-provider vendor selection (interface approach is approved, above).
 - Frontend build tooling (Vite vs. other) for the extension and dashboard —
   not yet decided; React + TypeScript + Mantine are fixed, the bundler is
   not.
-- Testing frameworks (e.g., pytest for backend, a JS test runner for
-  extension/dashboard) — not yet chosen; see `09-TESTING-STRATEGY.md`
-  (draft).
+- JS/TS test runner for extension/dashboard — not yet chosen; see
+  `09-TESTING-STRATEGY.md`.

@@ -3,11 +3,12 @@
 **Status:** PARTIALLY APPROVED
 - **Round 1 — API architecture, conventions, authentication transport, refresh-token
   concurrency, general idempotency mechanism: APPROVED.**
-- Per-endpoint contracts (Rounds 2–8: Authentication, Meeting Management, Audio Chunk
-  Processing endpoint-level detail, Transcript & Meeting Intelligence, Notes & Action
-  Items, Usage/Quota/Search/History, final consistency review): **NOT YET DESIGNED.**
+- **Round 2 — Authentication & account management endpoints: APPROVED.** See Part B.1.
+- Per-endpoint contracts (Rounds 3–8: Meeting Management, Audio Chunk Processing
+  endpoint-level detail, Transcript & Meeting Intelligence, Notes & Action Items,
+  Usage/Quota/Search/History, final consistency review): **NOT YET DESIGNED.**
 
-**Last updated:** 2026-11-09
+**Last updated:** 2026-11-10
 
 This document is split into two parts: Part A is the architecture and conventions every
 endpoint will follow (approved, below), and Part B is the per-endpoint surface (not yet
@@ -61,8 +62,11 @@ layer's point of view.
 | 429 | Rate limit exceeded |
 | 500 | Unhandled server error, generic body only — no internal exception detail ever serialized |
 
-**201 responses include a `Location` header** pointing at the newly created resource —
-a stated convention, not optional.
+**201 responses include a `Location` header** pointing at the newly created resource,
+**unless an endpoint explicitly documents an exception** — such exceptions are
+intentional (e.g. `POST /auth/register` in §B.1, where there is no single resource URL
+to point at) and are not optional once documented: an endpoint either follows the
+convention or explicitly states why it doesn't, never silently.
 
 ### Pagination requirements
 
@@ -124,7 +128,10 @@ request/response logging middleware, on any client.
 ### Rotation with reuse detection
 Every successful `POST /auth/refresh` revokes the token just used and issues a new one.
 Presenting an already-revoked token is a theft signal, **unless** it falls within a
-short legitimate-concurrency grace window (below).
+short legitimate-concurrency grace window (below). **Refresh-token lifetime: 30 days —
+PROPOSED.** (This value appears throughout the flows below as a working assumption; it
+was never separately surfaced as its own decision point before now — flagging that
+explicitly rather than treating prior silence as approval.)
 
 ### Encrypted grace-period mechanism (chosen over client-side cross-tab coordination)
 A hashed token (`token_hash`) cannot be reconstructed to hand back to a legitimate
@@ -300,6 +307,96 @@ FROM ts
 WHERE family_id = :family_id AND revoked_at IS NULL;
 ```
 
+### User-row lock for login, password-reset, and logout-all (a second race, closed the same way)
+
+Login validates a password via an application-level read-then-compare, not a single
+atomic operation. If a password reset commits — changing the password and revoking every
+refresh-token family — *between* login's read of the old hash and login's creation of a
+new session, that new session was authorized by a credential already dead by the time
+it's created, and the reset's revocation (having already run) has no way to retroactively
+catch it. The identical blind spot applies to `logout-all`'s family enumeration: a
+`WHERE user_id = ... AND revoked_at IS NULL` scan doesn't see a family created by a
+concurrent login that starts after the scan begins — the same escape-race as the
+family-wide revocation above, one level up.
+
+**Fix**: login, password-reset, and logout-all all acquire `SELECT ... FROM users WHERE
+id = :user_id FOR UPDATE` **first**, before validating a password or enumerating
+families. **Plain refresh and single-session logout never touch this lock** — neither
+validates a password nor enumerates across families, so they only ever need their own
+family's advisory lock, unchanged from above.
+
+**Alternative considered and rejected**: a `credential_version` counter on `users`,
+bumped on reset and compared before issuing a session. Rejected in favor of directly
+re-reading and re-comparing the password hash under the lock — same correctness, no new
+column.
+
+```sql
+-- Login
+BEGIN;
+SELECT id FROM users WHERE email = :email;   -- unlocked bootstrap, to learn which row to lock
+-- not found -> COMMIT; 401 invalid_credentials (no distinction from a wrong password)
+SELECT id, password_hash FROM users WHERE id = :candidate_id FOR UPDATE;
+-- Application code verifies :presented_password against THIS row's password_hash --
+-- the value just read under the lock, never one read earlier or elsewhere.
+-- Mismatch -> COMMIT (read-only); 401 invalid_credentials.
+INSERT INTO refresh_tokens (id, user_id, family_id, token_hash, expires_at, created_at)
+VALUES (:new_token_id, :candidate_id, :new_family_id, :new_token_hash,
+        clock_timestamp() + interval '30 days', clock_timestamp());
+COMMIT;
+```
+
+```sql
+-- Password reset (folds logout-all's revoke-everything logic into the same transaction)
+BEGIN;
+UPDATE password_reset_tokens SET consumed_at = now()
+WHERE token_hash = :hash AND consumed_at IS NULL AND expires_at > clock_timestamp()
+RETURNING user_id;
+-- 0 rows -> COMMIT; 400 invalid_or_expired_reset_token. No user lock for this outcome --
+-- nothing about the user is touched if the token itself doesn't check out.
+
+SELECT id FROM users WHERE id = :user_id FOR UPDATE;
+UPDATE users SET password_hash = :new_hash WHERE id = :user_id;
+
+family_ids := SELECT DISTINCT family_id FROM refresh_tokens
+              WHERE user_id = :user_id AND revoked_at IS NULL ORDER BY family_id;
+for fid in family_ids: SELECT pg_advisory_xact_lock(hashtextextended(fid::text, 0));
+for fid in family_ids:
+    UPDATE refresh_tokens SET revoked_at = clock_timestamp()
+    WHERE family_id = fid AND revoked_at IS NULL;
+COMMIT;
+```
+
+```sql
+-- Logout-all
+BEGIN;
+SELECT id FROM users WHERE id = :user_id FOR UPDATE;   -- :user_id from the caller's access token
+
+family_ids := SELECT DISTINCT family_id FROM refresh_tokens
+              WHERE user_id = :user_id AND revoked_at IS NULL ORDER BY family_id;
+for fid in family_ids: SELECT pg_advisory_xact_lock(hashtextextended(fid::text, 0));
+for fid in family_ids:
+    UPDATE refresh_tokens SET revoked_at = clock_timestamp()
+    WHERE family_id = fid AND revoked_at IS NULL;
+COMMIT;
+```
+
+**Why this closes the race in both directions**: whichever of these three operations
+acquires the user lock first runs to completion — visible to the other — before the
+other can even begin. If login wins first, its new family already exists (committed) by
+the time reset's or logout-all's enumeration runs afterward, so it's correctly swept up.
+If reset or logout-all wins first, login's `FOR UPDATE` blocks until they commit, so
+login re-reads the *already-changed* password hash (reset) or simply proceeds after the
+revocation already happened (logout-all) — never creating a session on top of a
+credential or session set that's already dead.
+
+**Global lock order, restated with this addition**: whenever a user-row lock and a
+family advisory lock are both needed, the **user lock is always acquired first** and
+held through every family lock taken afterward. Only login, password-reset, and
+logout-all ever acquire a user-row lock, and each acquires at most one (for the one user
+it operates on). Combined with the family-lock design above, no pair of operations —
+same user or different users — can form a lock-ordering cycle: deadlock-free by
+construction, not by coincidence.
+
 ## A.4 Chunk-upload response conventions
 
 | Status | When |
@@ -437,12 +534,13 @@ included) rolls back automatically, so a retry is correctly treated as brand-new
 
 **Expiration window: 24 hours — PROPOSED.**
 
-## A.6 Required schema additions (NOT YET APPLIED to `04-DATABASE-DESIGN.md`)
+## A.6 Required schema additions (APPLIED to `04-DATABASE-DESIGN.md`, revision round 7)
 
-Per `CLAUDE.md`, the approved database design is not silently modified. The two
-additions below are required to support this document's approved mechanisms and are
-presented here for visibility; they are only merged into `04-DATABASE-DESIGN.md` on a
-separate, explicit request to revisit that document.
+Per `CLAUDE.md`, the approved database design was not modified silently — these two
+additions were presented here first, then merged into `04-DATABASE-DESIGN.md` on your
+explicit approval (see that document's "Revision history," round 7, and its Alembic
+sequence, migrations `0003` and `0010`). Reproduced here for reference, since this is
+where the full operational reasoning for each column lives.
 
 ```sql
 -- Recommended shape for refresh_tokens, folded into migration 0003_users_and_auth's
@@ -506,14 +604,224 @@ been modified by this task.**
 
 ---
 
-# Part B — Per-endpoint contracts (NOT YET DESIGNED)
+# Part B — Per-endpoint contracts
 
-Endpoint groups to be designed in upcoming rounds, each producing concrete
-request/response schemas under the conventions in Part A:
+## B.1 Authentication & Account Management (APPROVED)
 
-- **Round 2** — Authentication & account management
+All nine endpoints you specified, plus one addition (`resend-verification`) called out
+explicitly as new rather than silently added. All inherit Part A's conventions
+(envelopes, status codes, error codes, pagination N/A here) unless noted otherwise.
+
+### Cross-cutting decisions for this group
+
+- **Password hashing: Argon2id — APPROVED.** OWASP's current recommended default for
+  new systems. Exact parameters (memory cost, iterations) remain **PROPOSED**.
+- **Password rule**: 10–128 characters, no forced composition rules — **PROPOSED**.
+- **JWT claims**: `sub`, `iat`, `exp` plus `iss` and `aud` — **APPROVED as a claim set**;
+  the exact `iss`/`aud` string values are **PROPOSED**. No `jti` — **APPROVED decision**,
+  justified below.
+- **Access-token lifetime: 15 minutes — PROPOSED** (value only; the architecture around
+  it is approved).
+- **No access-token denylist — APPROVED decision, justified, not merely deferred.** A
+  `jti` only earns its keep if something looks it up. Closing the window between a
+  revocation event and an already-issued access token's natural expiry would require
+  either a denylist (a new table plus a lookup on every authenticated request — a real
+  cost on the hot path) or materially shorter-lived access tokens (raising refresh
+  frequency for everyone to shrink a rare edge case). For this product's risk profile, a
+  bounded ≤15-minute window after an explicit security event is an accepted trade-off,
+  not a gap.
+- **Explicit, documented property**: refresh-token revocation (logout, logout-all,
+  password-reset) does **not** retroactively invalidate an access token already issued
+  before that point — it only prevents *future* issuance via refresh. An already-issued,
+  unexpired access token continues to pass signature+expiry verification until its own
+  `exp` passes.
+- **Email provider**: sent via an `EmailProvider` interface (see
+  `03-TECHNOLOGY-STACK.md`) — concrete vendor is **DEFERRED**, not part of this contract.
+- **Rate limiting**: mechanism and categories below are **APPROVED**; numeric limits are
+  **PROPOSED**.
+- **Idempotency**: none of these endpoints use the general `Idempotency-Key` mechanism
+  (§A.5) — each is safe to retry on its own terms (register: `users.email` UNIQUE;
+  login: naturally repeatable; refresh: its own bespoke mechanism in §A.3; logout/
+  logout-all: naturally idempotent; verify-email: idempotent-success on replay;
+  forgot-password: safe to repeat, rate-limited instead; reset-password: the one
+  deliberate exception where replay is a hard error, by design, not a gap).
+
+### 1. `POST /api/v1/auth/register`
+**Auth**: none. **Request**: `{"email": "...", "password": "..."}`.
+**Success**: `201 Created`, no `Location` header (stated exception to the general 201
+convention — there is no single resource URL this points at).
+```json
+{
+  "user": {"id": "...", "email": "...", "email_verified_at": null, "created_at": "..."},
+  "access_token": "...", "access_token_expires_at": "...", "refresh_token": "..."
+}
+```
+`refresh_token` present in the body only for extension-origin requests (cookie set
+instead for dashboard-origin, per §A.2). **Errors**: `422` schema; `409`
+`email_already_registered` (confirming a taken email here is standard signup UX, unlike
+`forgot-password`'s anti-enumeration rule below); `429` rate-limited.
+**Transaction**: one transaction — `INSERT ... ON CONFLICT (email) DO NOTHING RETURNING
+id`, the default `plan_tier_id` lookup, the `email_verification_tokens` insert, and the
+initial `refresh_tokens` row (a **fresh** `family_id` — never copied, no predecessor).
+Sending the verification email happens **after** commit, best-effort, never inside the
+transaction. **Registration auto-logs the user in — APPROVED**; see "Registration and
+verification behavior" below for what this does and doesn't gate.
+
+### 2. `POST /api/v1/auth/login`
+**Auth**: none. **Request**: `{"email": "...", "password": "..."}`.
+**Success**: `200 OK` (not 201 — "authenticate me," not "create a session resource";
+same body shape as register). **Errors**: `401` `invalid_credentials` — identical
+whether the email doesn't exist or the password is wrong, no distinction revealed.
+**Concurrency**: see A.3's "User-row lock for login, password-reset, and logout-all."
+**Security**: rate-limited per-IP and per-attempted-email (**PROPOSED** values) —
+deliberately no hard account lockout, which would itself be a denial-of-service vector
+against a specific victim's account.
+
+### 3. `POST /api/v1/auth/refresh`
+Fully specified in §A.3 — this entry only wraps it in HTTP terms. **Auth**: none via
+header; a valid refresh token via cookie (dashboard) or body (extension). **Request**:
+dashboard sends `{}` (satisfies the CSRF `Content-Type` defense; cookie carries the real
+token); extension sends `{"refresh_token": "..."}`. **Success**: `200 OK`,
+`{"access_token", "access_token_expires_at", "refresh_token"}`.
+
+| Outcome (§A.3) | HTTP | `error.code` |
+|---|---|---|
+| Token not found at all | 401 | `invalid_refresh_token` |
+| `FAIL_GRACE_EXPIRED` | 401 | `refresh_token_grace_expired` |
+| `FAIL_REUSE_DETECTED` | 401 | `refresh_token_reuse_detected` |
+
+All three require the same client action (clear tokens, show login); kept distinct for
+observability, not because the client branches on them.
+
+### 4. `POST /api/v1/auth/logout`
+**Auth**: refresh token only (same transport as refresh) — deliberately not requiring a
+valid access token, since logout must succeed even for an already-expired session.
+```sql
+BEGIN;
+SELECT family_id FROM refresh_tokens WHERE token_hash = :presented_hash;
+-- not found at all -> treat as already logged out.
+SELECT pg_advisory_xact_lock(hashtextextended(:family_id::text, 0));
+UPDATE refresh_tokens SET revoked_at = clock_timestamp()
+WHERE family_id = :family_id AND revoked_at IS NULL;
+COMMIT;
+```
+Revokes whatever is *currently* live in the presented token's family — correct even if
+the calling tab holds an older, already-rotated-away token. **Success**: `204 No
+Content`, always — found-and-revoked, already-revoked, and not-found-at-all all produce
+the identical response.
+
+### 5. `POST /api/v1/auth/logout-all`
+**Auth**: valid **access token** (not the refresh-token transport) — scoped by
+`user_id`, which the access token already carries; the calling session's own family is
+naturally included in the enumeration below, so "log out everywhere" correctly includes
+"here." **Concurrency**: see A.3's user-row-lock subsection. **Success**: `204 No
+Content`. **Boundary condition, explicit, not a bug**: a login completing after the
+family-enumeration step but before this transaction finishes isn't included — a
+revocation is a point-in-time action, not a standing ban on future logins.
+
+### 6. `GET /api/v1/auth/me`
+**Auth**: valid access token. **Success**: `200 OK`:
+```json
+{"id": "...", "email": "...", "email_verified_at": null, "plan_tier": {"name": "free"}, "created_at": "..."}
+```
+Identity-scoped only — quota *usage* numbers stay in a later round's endpoint. Pure
+read, no transaction, no idempotency concern.
+
+### 7. `POST /api/v1/auth/verify-email`
+**Auth**: none — the token in the body is the credential; must work even if the caller
+isn't logged in on this device. **Request**: `{"token": "..."}`.
+```sql
+BEGIN;
+UPDATE email_verification_tokens SET consumed_at = now()
+WHERE token_hash = :hash AND consumed_at IS NULL AND expires_at > clock_timestamp()
+RETURNING user_id;
+-- row returned:
+UPDATE users SET email_verified_at = now() WHERE id = :user_id AND email_verified_at IS NULL;
+COMMIT;
+-- 0 rows -> fallback read, ALSO using clock_timestamp() -- this read can be reached
+-- right after this same transaction's UPDATE already blocked on a concurrent duplicate
+-- submission of the identical token, so a frozen now() would be equally stale here:
+SELECT consumed_at, expires_at FROM email_verification_tokens WHERE token_hash = :hash;
+-- consumed_at IS NOT NULL                          -> 200, idempotent "already verified."
+-- consumed_at IS NULL AND expires_at <= clock_timestamp() -> 400 verification_token_expired.
+-- not found                                         -> 400 invalid_verification_token.
+COMMIT;
+```
+`consumed_at`'s own assignment correctly stays `now()` — it's a pure audit marker, never
+later used as a comparison anchor by another transaction, unlike `expires_at`'s
+comparison above. **Replay is deliberately idempotent-success** (contrast with
+reset-password below): the end state ("is this email verified") is already unambiguous
+and true, so treating a replay as an error would just be unfriendly. **Expiry: 24 hours
+— PROPOSED.**
+
+### 8. `POST /api/v1/auth/forgot-password`
+**Request**: `{"email": "..."}`. **Success**: `200 OK`, **always the identical generic
+body**, regardless of whether the email exists — the explicit anti-enumeration
+requirement. If the email exists: invalidate prior unconsumed reset tokens for that user,
+create a new one, send the email after commit (best-effort, same pattern as
+registration). If it doesn't: do nothing, same response either way. **Residual risk,
+stated not hidden**: response timing could theoretically differ between the two paths (a
+low-severity side channel) — not engineering a constant-time fix for v1. **Security**:
+rate-limited **per-email**, not just per-IP (**PROPOSED** values) — email-bombing a
+victim's address is the realistic abuse case here. **Expiry: 1 hour — PROPOSED**
+(shorter than email verification, reflecting higher sensitivity).
+
+### 9. `POST /api/v1/auth/reset-password`
+**Request**: `{"token": "...", "new_password": "..."}`.
+```sql
+BEGIN;
+UPDATE password_reset_tokens SET consumed_at = now()
+WHERE token_hash = :hash AND consumed_at IS NULL AND expires_at > clock_timestamp()
+RETURNING user_id;
+-- 0 rows -> COMMIT; 400 invalid_or_expired_reset_token.
+-- row returned -> proceed into A.3's user-lock + password-change + revoke-all flow.
+```
+**Replay is deliberately a hard error**, unlike email verification: a reset token
+authorizes a credential *mutation*, so a second use is either a confused client or a
+replay attempt, and the safe response in either case is rejection, never success. Does
+not require the old password (the token itself, delivered via a separate channel, is the
+authorization). Same password rule as registration.
+
+### 10. `POST /api/v1/auth/resend-verification` — recommended addition
+Without this, a user whose verification token expires has no way to get a new one.
+**Auth**: valid access token (the caller is already logged in via auto-login; no
+anti-enumeration concern since we already know exactly who they are). **Success**: `200
+OK` — `{"status": "already_verified"}` if `email_verified_at` is already set (no new
+token created), else invalidates prior unconsumed verification tokens and creates a new
+one, same pattern as `forgot-password`. Rate-limited per-user (**PROPOSED** values).
+
+### Registration and verification behavior — confirmed decisions
+
+- `email_verified_at` stays `NULL` until `verify-email` succeeds — true by construction.
+- **Unverified users have full application access in v1 — no feature is gated on
+  verification status.** Confirmed per your directive to retain auto-login as the
+  approach.
+- **No restrictions on unverified accounts** — no concrete restriction to propose given
+  the current feature set (no collaboration/sharing, no account-email-change feature
+  exists). May need revisiting if either is added later.
+- Exposure to clients: via `GET /auth/me`'s `email_verified_at` field only — how the
+  dashboard renders a reminder banner, or whether the extension surfaces it at all, is a
+  UI/UX decision for `07-DASHBOARD-UI-UX-SPECIFICATION.md`, not this document.
+- **Still open, product-level, not technical**: with zero restrictions tied to
+  verification, what is verification actually *for* in v1 (recovery reliability?
+  anti-fake-account hygiene?) — not a blocker for this document, but worth an explicit
+  answer before it's forgotten.
+
+### Rate-limiting categories (mechanism APPROVED, numbers PROPOSED)
+In-process/in-memory (no Redis/Celery, per the approved stack) — **accepted limitation**:
+counters reset on restart, and don't coordinate across multiple backend processes if
+ever scaled horizontally; revisit before any such scaling, not a v1 concern.
+- Per-IP: `register`, `login`, `refresh`, `verify-email`, `resend-verification`.
+- Per-email (in addition to per-IP): `forgot-password`, `resend-verification`
+  (email-bombing is the realistic abuse case for both), `login` (the stated alternative
+  to a hard account lockout).
+- `logout`/`logout-all`: low priority — abuse here only logs people out, not a
+  credential/data exposure risk; a light generic per-IP ceiling is enough.
+
+## Remaining rounds (NOT YET DESIGNED)
+
 - **Round 3** — Meeting management
-- **Round 4** — Audio chunk processing (endpoint-level detail beyond Part A.4's conventions)
+- **Round 4** — Audio chunk processing (endpoint-level detail beyond §A.4's conventions)
 - **Round 5** — Transcript & meeting intelligence
 - **Round 6** — Notes & action items
 - **Round 7** — Usage, quota, search & history
@@ -521,4 +829,4 @@ request/response schemas under the conventions in Part A:
 
 ## Recommended next step
 
-Begin Round 2 (Authentication APIs) once explicitly approved — not before.
+Begin Round 3 (Meeting Management APIs) once explicitly approved — not before.

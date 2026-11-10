@@ -1,9 +1,9 @@
 # Notelify AI — Database Design
 
 **Status:** APPROVED (this is the final, reviewed schema and transaction
-design after multiple correction rounds — see "Revision history" at the
+design after seven correction rounds — see "Revision history" at the
 bottom for what each round fixed)
-**Last updated:** 2026-11-09
+**Last updated:** 2026-11-10
 **Requires:** PostgreSQL 15+ (column-scoped `ON DELETE SET NULL (column)` on
 composite foreign keys)
 
@@ -17,6 +17,8 @@ erDiagram
     users ||--o{ password_reset_tokens : "user_id"
     users ||--o{ meetings : "user_id"
     users ||--o{ usage_events : "user_id"
+    users ||--o{ idempotency_keys : "user_id"
+    refresh_tokens ||--o| refresh_tokens : "replaced_by_token_id"
     meetings ||--o{ transcript_chunks : "meeting_id"
     meetings ||--o{ decisions : "meeting_id"
     meetings ||--o{ action_items : "meeting_id"
@@ -59,15 +61,35 @@ CREATE TABLE users (
 -- meaningful, and DATE has no timezone to get wrong.
 
 CREATE TABLE refresh_tokens (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_hash  TEXT NOT NULL,
-    expires_at  TIMESTAMPTZ NOT NULL,
-    revoked_at  TIMESTAMPTZ,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id              UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    family_id            UUID NOT NULL,                -- no column default; always application-supplied
+    token_hash           TEXT NOT NULL,
+    expires_at           TIMESTAMPTZ NOT NULL,
+    revoked_at           TIMESTAMPTZ,
+    replaced_by_token_id UUID REFERENCES refresh_tokens(id) ON DELETE SET NULL,
+    grace_ciphertext     BYTEA,                         -- reversibly encrypted, short-lived only
+    grace_expires_at     TIMESTAMPTZ,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_refresh_tokens_user ON refresh_tokens(user_id);
 CREATE INDEX idx_refresh_tokens_hash ON refresh_tokens(token_hash);
+CREATE INDEX idx_refresh_tokens_family ON refresh_tokens(family_id);
+```
+`family_id` groups a token and every token it's ever rotated into, enabling
+reuse-detection to revoke an entire compromised lineage rather than one row. It has no
+column default — a login assigns a fresh value, a rotation always copies the parent's
+value forward — there is no context-free "right" default. `replaced_by_token_id` records
+which row a given token was rotated into, both for reuse-detection's chain-walk and for
+resolving a legitimate concurrent-refresh race (two tabs presenting the same just-rotated
+token) without ever exposing the hashed value directly: `grace_ciphertext` holds a
+short-lived, reversibly encrypted copy of a newly-issued token's raw value, decryptable
+only by application code holding a server-side key that never appears in SQL, and
+`grace_expires_at` bounds how long that copy survives. The full transaction flows, lock
+discipline, and reuse-detection algorithm that use these columns are in
+`05-API-CONTRACTS.md` §A.3 — this document holds the schema; that one holds the
+operational logic, to avoid duplicating a long narrative in two places.
+```sql
 
 CREATE TABLE email_verification_tokens (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -235,7 +257,35 @@ CREATE TABLE meeting_notes (
     FOREIGN KEY (meeting_id, user_id) REFERENCES meetings(id, user_id) ON DELETE CASCADE
 );
 CREATE INDEX idx_meeting_notes_meeting ON meeting_notes(meeting_id);
+
+-- ===== Idempotency keys (supports idempotent POST /meetings, /notes, /action-items) =====
+CREATE TABLE idempotency_keys (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id              UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    endpoint             TEXT NOT NULL,
+    resource_scope       TEXT NOT NULL DEFAULT '',   -- parent resource id, or '' sentinel -- never NULL
+    key                  TEXT NOT NULL,
+    request_fingerprint  TEXT NOT NULL,
+    response_status      INTEGER,
+    response_body        JSONB,
+    response_headers     JSONB,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at           TIMESTAMPTZ NOT NULL,
+    UNIQUE (user_id, endpoint, resource_scope, key)
+);
+CREATE INDEX idx_idempotency_expiry ON idempotency_keys(expires_at);
 ```
+`resource_scope` uses the empty-string sentinel rather than `NULL` deliberately —
+Postgres treats every `NULL` as distinct from every other `NULL` in a `UNIQUE`
+constraint, which would silently defeat deduplication for the one endpoint
+(`create_meeting`) that has no parent resource. `idx_idempotency_expiry` backs a
+maintenance-only cleanup job — expiry *correctness* comes from a conditional reclaim at
+write time, not from that job running on schedule. This table supports exactly three
+endpoints (`POST /meetings`, `POST /meetings/{id}/notes`, `POST
+/meetings/{id}/action-items`); chunk upload and finalize keep their own, unrelated
+idempotency built directly into `transcript_chunks`. Full transaction flow, the
+single-transaction correctness argument, and the exact reclaim logic are in
+`05-API-CONTRACTS.md` §A.5.
 
 ### Ownership-integrity design notes
 
@@ -650,13 +700,21 @@ hard bound — past it, remaining work is explicitly and visibly abandoned
 
 1. `0001_enable_extensions` — `pgcrypto`, `citext`
 2. `0002_plan_tiers` — create table, seed `free` row
-3. `0003_users_and_auth` — `users`, `refresh_tokens`, `email_verification_tokens`, `password_reset_tokens`
+3. `0003_users_and_auth` — `users`, `refresh_tokens` (**including `family_id`,
+   `replaced_by_token_id`, `grace_ciphertext`, `grace_expires_at` from the start** — the
+   project has never been implemented, so there are no existing `refresh_tokens` rows to
+   backfill; folding these into the original `CREATE TABLE` avoids the real problem a
+   later `ALTER TABLE ... ADD COLUMN ... DEFAULT gen_random_uuid()` would have on a live
+   table, where the volatile default is evaluated separately per existing row, assigning
+   each one an unrelated `family_id` and silently breaking lineage tracking for every
+   pre-existing token), `email_verification_tokens`, `password_reset_tokens`
 4. `0004_meetings` — `meeting_status` enum, `meetings` table (including `quota_exceeded_at`, `summary_schema_version`)
 5. `0005_transcript_chunks` — `chunk_status`, `chunk_source` enums, `transcript_chunks` table (lease columns `NOT NULL`, `is_exhausted` generated column, full constraint set)
 6. `0006_usage_events` — including the `source`-inclusive unique constraint
 7. `0007_summarization_jobs` — `job_status` enum, lease/retry columns
 8. `0008_decisions_and_action_items` — `action_item_status` enum, composite FKs to `transcript_chunks`
 9. `0009_meeting_notes` — composite FK to `meetings`
+10. `0010_idempotency_keys` — new table, no pre-existing-row concern
 
 Each migration is additive-only (no column drops/renames) and applies
 cleanly to an empty database.
@@ -705,3 +763,19 @@ cleanly to an empty database.
    other flow, and fixed the deadline-forced sweep to set
    `attempt_count = max_attempts` (without this, a forced-failed chunk could
    never become `is_exhausted`, permanently blocking `all_resolved`).
+7. **Schema closure for two mechanisms designed during `05-API-CONTRACTS.md`'s
+   API-architecture review, not part of the original six rounds above** —
+   added `family_id`, `replaced_by_token_id`, `grace_ciphertext`, and
+   `grace_expires_at` to `refresh_tokens`, supporting refresh-token reuse
+   detection with a bounded legitimate-concurrency grace period; added the
+   `idempotency_keys` table, supporting idempotent `POST /meetings` /
+   `/notes` / `/action-items`. Neither addition touches any of the six prior
+   rounds' tables, columns, or transaction flows — purely additive. The
+   operational logic (transaction flows, lock discipline, the reuse-detection
+   chain-walk, the single-transaction idempotency design) lives in
+   `05-API-CONTRACTS.md` §A.3 and §A.5, not duplicated here. **Explicitly out
+   of scope for this round, deferred separately**: `04`'s own pre-existing
+   `now()`-after-a-possible-lock-wait pattern (`locked_until < now()` in three
+   places, `now() >= reconciliation_deadline_at` in two, plus their paired
+   assignments) was identified during the same review but was not requested
+   to be fixed in this pass and has not been touched.
